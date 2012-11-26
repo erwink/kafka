@@ -17,16 +17,13 @@
 
 package kafka.consumer
 
-import org.apache.log4j.Logger
 import scala.collection.JavaConversions._
-import kafka.utils.{Utils, ZkUtils, ZKStringSerializer}
+import kafka.utils.{ZkUtils, ZKStringSerializer, Logging}
 import org.I0Itec.zkclient.{IZkStateListener, IZkChildListener, ZkClient}
 import org.apache.zookeeper.Watcher.Event.KeeperState
 
 class ZookeeperTopicEventWatcher(val config:ConsumerConfig,
-    val eventHandler: TopicEventHandler[String]) {
-
-  private val logger = Logger.getLogger(getClass)
+    val eventHandler: TopicEventHandler[String]) extends Logging {
 
   val lock = new Object()
 
@@ -36,7 +33,7 @@ class ZookeeperTopicEventWatcher(val config:ConsumerConfig,
   startWatchingTopicEvents()
 
   private def startWatchingTopicEvents() {
-    val topicEventListener = new ZkTopicEventListener
+    val topicEventListener = new ZkTopicEventListener()
     ZkUtils.makeSurePersistentPathExists(zkClient, ZkUtils.BrokerTopicsPath)
 
     zkClient.subscribeStateChanges(
@@ -53,24 +50,18 @@ class ZookeeperTopicEventWatcher(val config:ConsumerConfig,
 
   def shutdown() {
     lock.synchronized {
-      try {
-        if (zkClient != null) {
-          stopWatchingTopicEvents()
-          zkClient.close()
-          zkClient = null
-        }
-        else
-          logger.warn("Cannot shutdown already shutdown topic event watcher.")
+      info("Shutting down topic event watcher.")
+      if (zkClient != null) {
+        stopWatchingTopicEvents()
+        zkClient.close()
+        zkClient = null
       }
-      catch {
-        case e =>
-          logger.fatal(e)
-          logger.fatal(Utils.stackTrace(e))
-      }
+      else
+        warn("Cannot shutdown already shutdown topic event watcher.")
     }
   }
 
-  class ZkTopicEventListener() extends IZkChildListener {
+  class ZkTopicEventListener extends IZkChildListener {
 
     @throws(classOf[Exception])
     def handleChildChange(parent: String, children: java.util.List[String]) {
@@ -78,15 +69,14 @@ class ZookeeperTopicEventWatcher(val config:ConsumerConfig,
         try {
           if (zkClient != null) {
             val latestTopics = zkClient.getChildren(ZkUtils.BrokerTopicsPath).toList
-            logger.debug("all topics: %s".format(latestTopics))
+            debug("all topics: %s".format(latestTopics))
 
             eventHandler.handleTopicEvent(latestTopics)
           }
         }
         catch {
           case e =>
-            logger.fatal(e)
-            logger.fatal(Utils.stackTrace(e))
+            error("error in handling child changes", e)
         }
       }
     }
@@ -103,7 +93,7 @@ class ZookeeperTopicEventWatcher(val config:ConsumerConfig,
     def handleNewSession() {
       lock.synchronized {
         if (zkClient != null) {
-          logger.info(
+          info(
             "ZK expired: resubscribing topic event listener to topic registry")
           zkClient.subscribeChildChanges(
             ZkUtils.BrokerTopicsPath, topicEventListener)

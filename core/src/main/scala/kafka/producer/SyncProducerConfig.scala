@@ -19,7 +19,6 @@ package kafka.producer
 
 import kafka.utils.Utils
 import java.util.Properties
-import kafka.message.{CompressionUtils, CompressionCodec}
 
 class SyncProducerConfig(val props: Properties) extends SyncProducerConfigShared {
   /** the broker to which the producer sends events */
@@ -40,6 +39,9 @@ trait SyncProducerConfigShared {
   val socketTimeoutMs = Utils.getInt(props, "socket.timeout.ms", 30000)  
 
   val reconnectInterval = Utils.getInt(props, "reconnect.interval", 30000)
+
+  /** negative reconnect time interval means disabling this time-based reconnect feature */
+  var reconnectTimeInterval = Utils.getInt(props, "reconnect.time.interval.ms", 1000*1000*10)
 
   val maxMessageSize = Utils.getInt(props, "max.message.size", 1000000)
 }

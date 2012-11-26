@@ -20,19 +20,18 @@ package kafka.tools
 
 import joptsimple._
 import org.I0Itec.zkclient.ZkClient
-import kafka.utils.{ZkUtils, ZKStringSerializer}
-import org.apache.log4j.Logger
+import kafka.utils.{ZkUtils, ZKStringSerializer, Logging}
 import kafka.consumer.SimpleConsumer
 import collection.mutable.Map
-object ConsumerOffsetChecker {
-  private val logger = Logger.getLogger(getClass)
+object ConsumerOffsetChecker extends Logging {
 
   private val consumerMap: Map[String, Option[SimpleConsumer]] = Map()
 
   private val BidPidPattern = """(\d+)-(\d+)""".r
 
-  private val BrokerIpPattern = """.*:(\d+\.\d+\.\d+\.\d+):(\d+$)""".r
+  private val BrokerIpPattern = """.*:([^:]+):(\d+$)""".r
   // e.g., 127.0.0.1-1315436360737:127.0.0.1:9092
+  // e.g., host.domain.com-1315436360737:host.domain.com:9092
 
   private def getConsumer(zkClient: ZkClient, bid: String): Option[SimpleConsumer] = {
     val brokerInfo = ZkUtils.readDataMaybeNull(zkClient, "/brokers/ids/%s".format(bid))
@@ -40,7 +39,7 @@ object ConsumerOffsetChecker {
       case BrokerIpPattern(ip, port) =>
         Some(new SimpleConsumer(ip, port.toInt, 10000, 100000))
       case _ =>
-        logger.error("Could not parse broker info %s".format(brokerInfo))
+        error("Could not parse broker info %s".format(brokerInfo))
         None
     }
     consumer
@@ -75,14 +74,14 @@ object ConsumerOffsetChecker {
           case None => // ignore
         }
       case _ =>
-        logger.error("Could not parse broker/partition pair %s".format(bidPid))
+        error("Could not parse broker/partition pair %s".format(bidPid))
     }
   }
 
   private def processTopic(zkClient: ZkClient, group: String, topic: String) {
     val bidsPids = ZkUtils.getChildrenParentMayNotExist(
       zkClient, "/consumers/%s/offsets/%s".format(group, topic)).toList
-    bidsPids.foreach {
+    bidsPids.sorted.foreach {
       bidPid => processPartition(zkClient, group, topic, bidPid)
     }
   }
@@ -139,10 +138,10 @@ object ConsumerOffsetChecker {
           zkClient, "/consumers/%s/offsets".format(group)).toList
       }
 
-      logger.debug("zkConnect = %s; topics = %s; group = %s".format(
+      debug("zkConnect = %s; topics = %s; group = %s".format(
         zkConnect, topicList.toString(), group))
 
-      topicList.foreach {
+      topicList.sorted.foreach {
         topic => processTopic(zkClient, group, topic)
       }
 

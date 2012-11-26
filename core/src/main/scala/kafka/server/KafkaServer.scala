@@ -17,12 +17,10 @@
 
 package kafka.server
 
-import scala.reflect.BeanProperty
-import org.apache.log4j.Logger
 import kafka.log.LogManager
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
-import kafka.utils.{Mx4jLoader, Utils, SystemTime, KafkaScheduler}
+import kafka.utils.{Mx4jLoader, Utils, SystemTime, KafkaScheduler, Logging}
 import kafka.network.{SocketServerStats, SocketServer}
 import java.io.File
 
@@ -30,12 +28,11 @@ import java.io.File
  * Represents the lifecycle of a single Kafka broker. Handles all functionality required
  * to start up and shutdown a single Kafka node.
  */
-class KafkaServer(val config: KafkaConfig) {
+class KafkaServer(val config: KafkaConfig) extends Logging {
   val CLEAN_SHUTDOWN_FILE = ".kafka_cleanshutdown"
-  private val isShuttingDown = new AtomicBoolean(false)
-  
-  private val logger = Logger.getLogger(classOf[KafkaServer])
-  private val shutdownLatch = new CountDownLatch(1)
+  private var isShuttingDown = new AtomicBoolean(false)
+  private var shutdownLatch = new CountDownLatch(1)
+
   private val statsMBeanName = "kafka:type=kafka.SocketServerStats"
   
   var socketServer: SocketServer = null
@@ -49,42 +46,40 @@ class KafkaServer(val config: KafkaConfig) {
    * Instantiates the LogManager, the SocketServer and the request handlers - KafkaRequestHandlers
    */
   def startup() {
-    try {
-      logger.info("Starting Kafka server...")
-      var needRecovery = true
-      val cleanShutDownFile = new File(new File(config.logDir), CLEAN_SHUTDOWN_FILE)
-      if (cleanShutDownFile.exists) {
-        needRecovery = false
-        cleanShutDownFile.delete
-      }
-      logManager = new LogManager(config,
-                                  scheduler,
-                                  SystemTime,
-                                  1000L * 60 * config.logCleanupIntervalMinutes,
-                                  1000L * 60 * 60 * config.logRetentionHours,
-                                  needRecovery)
+    info("Starting Kafka server...")
+    isShuttingDown = new AtomicBoolean(false)
+    shutdownLatch = new CountDownLatch(1)
+    var needRecovery = true
+    val cleanShutDownFile = new File(new File(config.logDir), CLEAN_SHUTDOWN_FILE)
+    if (cleanShutDownFile.exists) {
+      needRecovery = false
+      cleanShutDownFile.delete
+    }
+    logManager = new LogManager(config,
+                                scheduler,
+                                SystemTime,
+                                1000L * 60 * 60 * config.logRollHours,
+                                1000L * 60 * config.logCleanupIntervalMinutes,
+                                1000L * 60 * 60 * config.logRetentionHours,
+                                needRecovery)
                                                     
-      val handlers = new KafkaRequestHandlers(logManager)
-      socketServer = new SocketServer(config.port,
-                                      config.numThreads,
-                                      config.monitoringPeriodSecs,
-                                      handlers.handlerFor,
-                                      config.maxSocketRequestSize)
-      Utils.swallow(logger.warn, Utils.registerMBean(socketServer.stats, statsMBeanName))
-      socketServer.startup
-      Mx4jLoader.maybeLoad
-      /**
-       *  Registers this broker in ZK. After this, consumers can connect to broker.
-       *  So this should happen after socket server start.
-       */
-      logManager.startup
-      logger.info("Server started.")
-    }
-    catch {
-      case e =>
-        logger.fatal("Fatal error during startup.", e)
-        shutdown
-    }
+    val handlers = new KafkaRequestHandlers(logManager)
+    socketServer = new SocketServer(config.port,
+                                    config.numThreads,
+                                    config.monitoringPeriodSecs,
+                                    handlers.handlerFor,
+                                    config.socketSendBuffer,
+                                    config.socketReceiveBuffer,                                    
+                                    config.maxSocketRequestSize)
+    Utils.registerMBean(socketServer.stats, statsMBeanName)
+    socketServer.startup()
+    Mx4jLoader.maybeLoad
+    /**
+     *  Registers this broker in ZK. After this, consumers can connect to broker.
+     *  So this should happen after socket server start.
+     */
+    logManager.startup()
+    info("Kafka server started.")
   }
   
   /**
@@ -94,25 +89,19 @@ class KafkaServer(val config: KafkaConfig) {
   def shutdown() {
     val canShutdown = isShuttingDown.compareAndSet(false, true);
     if (canShutdown) {
-      logger.info("Shutting down...")
-      try {
-        scheduler.shutdown()
-        if (socketServer != null)
-          socketServer.shutdown()
-        Utils.swallow(logger.warn, Utils.unregisterMBean(statsMBeanName))
-        if (logManager != null)
-          logManager.close()
+      info("Shutting down Kafka server")
+      scheduler.shutdown()
+      if (socketServer != null)
+        socketServer.shutdown()
+      Utils.unregisterMBean(statsMBeanName)
+      if (logManager != null)
+        logManager.close()
 
-        val cleanShutDownFile = new File(new File(config.logDir), CLEAN_SHUTDOWN_FILE)
-        cleanShutDownFile.createNewFile
-      }
-      catch {
-        case e =>
-          logger.fatal(e)
-          logger.fatal(Utils.stackTrace(e))
-      }
+      val cleanShutDownFile = new File(new File(config.logDir), CLEAN_SHUTDOWN_FILE)
+      cleanShutDownFile.createNewFile
+
       shutdownLatch.countDown()
-      logger.info("shut down completed")
+      info("Kafka server shut down completed")
     }
   }
   

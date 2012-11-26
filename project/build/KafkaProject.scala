@@ -23,6 +23,7 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
   lazy val core = project("core", "core-kafka", new CoreKafkaProject(_))
   lazy val examples = project("examples", "java-examples", new KafkaExamplesProject(_), core)
   lazy val contrib = project("contrib", "contrib", new ContribProject(_))
+  lazy val perf = project("perf", "perf", new KafkaPerfProject(_))
 
   lazy val releaseZipTask = core.packageDistTask
 
@@ -39,7 +40,7 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
   val rat = "org.apache.rat" % "apache-rat" % "0.8"
 
   class CoreKafkaProject(info: ProjectInfo) extends DefaultProject(info)
-     with IdeaProject with CoreDependencies with TestDependencies {
+     with IdeaProject with CoreDependencies with TestDependencies with CompressionDependencies {
    val corePackageAction = packageAllAction
 
   //The issue is going from log4j 1.2.14 to 1.2.15, the developers added some features which required
@@ -51,35 +52,13 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
       <exclude module="jmxtools"/>
       <exclude module="mail"/>
       <exclude module="jms"/>
-      <dependency org="org.apache.zookeeper" name="zookeeper" rev="3.3.3">
+      <dependency org="org.apache.zookeeper" name="zookeeper" rev="3.3.4">
         <exclude module="log4j"/>
         <exclude module="jline"/>
       </dependency>
+      <dependency org="com.github.sgroschupf" name="zkclient" rev="0.1">
+      </dependency>
     </dependencies>
-
-    def zkClientDep =
-      <dependency>
-       <groupId>zkclient</groupId>
-       <artifactId>zkclient</artifactId>
-       <version>20110412</version>
-       <scope>compile</scope>
-       </dependency>
-
-  object ZkClientDepAdder extends RuleTransformer(new RewriteRule() {
-      override def transform(node: Node): Seq[Node] = node match {
-        case Elem(prefix, "dependencies", attribs, scope, deps @ _*) => {
-          Elem(prefix, "dependencies", attribs, scope, deps ++ zkClientDep :_*)
-        }
-        case other => other
-      }
-    })
-
-    override def pomPostProcess(pom: Node): Node = {
-      ZkClientDepAdder(pom)
-    }
-
-    override def repositories = Set(ScalaToolsSnapshots, "JBoss Maven 2 Repository" at "http://repository.jboss.com/maven2",
-      "Oracle Maven 2 Repository" at "http://download.oracle.com/maven", "maven.org" at "http://repo2.maven.org/maven2/")
 
     override def artifactID = "kafka"
     override def filterScalaJars = false
@@ -143,6 +122,29 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
 
   }
 
+  class KafkaPerfProject(info: ProjectInfo) extends DefaultProject(info)
+     with IdeaProject
+     with CoreDependencies {
+    val perfPackageAction = packageAllAction
+    val dependsOnCore = core
+
+  //The issue is going from log4j 1.2.14 to 1.2.15, the developers added some features which required
+  // some dependencies on various sun and javax packages.
+   override def ivyXML =
+    <dependencies>
+      <exclude module="javax"/>
+      <exclude module="jmxri"/>
+      <exclude module="jmxtools"/>
+      <exclude module="mail"/>
+      <exclude module="jms"/>
+    </dependencies>
+
+    override def artifactID = "kafka-perf"
+    override def filterScalaJars = false
+    override def javaCompileOptions = super.javaCompileOptions ++
+      List(JavaCompileOption("-Xlint:unchecked"))
+  }
+
   class KafkaExamplesProject(info: ProjectInfo) extends DefaultProject(info)
      with IdeaProject
      with CoreDependencies {
@@ -189,6 +191,9 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
          <dependency org="org.apache.hadoop" name="hadoop-core" rev="0.20.2">
            <exclude module="junit"/>
          </dependency>
+         <dependency org="org.apache.pig" name="pig" rev="0.8.0">
+           <exclude module="junit"/>
+         </dependency>
        </dependencies>
 
     }
@@ -205,7 +210,11 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
            <exclude module="jmxtools"/>
            <exclude module="mail"/>
            <exclude module="jms"/>
+           <exclude module=""/>
          <dependency org="org.apache.hadoop" name="hadoop-core" rev="0.20.2">
+           <exclude module="junit"/>
+         </dependency>
+         <dependency org="org.apache.pig" name="pig" rev="0.8.0">
            <exclude module="junit"/>
          </dependency>
        </dependencies>
@@ -224,13 +233,17 @@ class KafkaProject(info: ProjectInfo) extends ParentProject(info) with IdeaProje
     val log4j = "log4j" % "log4j" % "1.2.15"
     val jopt = "net.sf.jopt-simple" % "jopt-simple" % "3.2"
   }
-
+  
   trait HadoopDependencies {
     val avro = "org.apache.avro" % "avro" % "1.4.0"
     val commonsLogging = "commons-logging" % "commons-logging" % "1.0.4"
     val jacksonCore = "org.codehaus.jackson" % "jackson-core-asl" % "1.5.5"
     val jacksonMapper = "org.codehaus.jackson" % "jackson-mapper-asl" % "1.5.5"
     val hadoop = "org.apache.hadoop" % "hadoop-core" % "0.20.2"
+  }
+
+  trait CompressionDependencies {
+    val snappy = "org.xerial.snappy" % "snappy-java" % "1.0.4.1"	
   }
 
 }

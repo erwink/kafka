@@ -23,11 +23,13 @@ import kafka.server.KafkaConfig
 import org.scalatest.junit.JUnitSuite
 import org.junit.{After, Before, Test}
 import kafka.utils.{Utils, MockTime, TestUtils}
-import kafka.common.OffsetOutOfRangeException
+import kafka.common.{InvalidTopicException, OffsetOutOfRangeException}
+import collection.mutable.ArrayBuffer
 
 class LogManagerTest extends JUnitSuite {
 
   val time: MockTime = new MockTime()
+  val maxSegAge = 100
   val maxLogAge = 1000
   var logDir: File = null
   var logManager: LogManager = null
@@ -39,8 +41,9 @@ class LogManagerTest extends JUnitSuite {
     config = new KafkaConfig(props) {
                    override val logFileSize = 1024
                    override val enableZookeeper = false
+                   override val flushInterval = 100
                  }
-    logManager = new LogManager(config, null, time, -1, maxLogAge, false)
+    logManager = new LogManager(config, null, time, maxSegAge, -1, maxLogAge, false)
     logManager.startup
     logDir = logManager.logDir
   }
@@ -53,10 +56,44 @@ class LogManagerTest extends JUnitSuite {
   
   @Test
   def testCreateLog() {
-    val log = logManager.getOrCreateLog("kafka", 0)
+    val name = "kafka"
+    val log = logManager.getOrCreateLog(name, 0)
+    val logFile = new File(config.logDir, name + "-0")
+    assertTrue(logFile.exists)
     log.append(TestUtils.singleMessageSet("test".getBytes()))
   }
 
+  @Test
+  def testGetLog() {
+    val name = "kafka"
+    val log = logManager.getLog(name, 0)
+    val logFile = new File(config.logDir, name + "-0")
+    assertTrue(!logFile.exists)
+  }
+
+  @Test
+  def testInvalidTopicName() {
+    val invalidTopicNames = new ArrayBuffer[String]()
+    invalidTopicNames += ("", ".", "..")
+    var longName = "ATCG"
+    for (i <- 3 to 8)
+      longName += longName
+    invalidTopicNames += longName
+    val badChars = Array('/', '\u0000', '\u0001', '\u0018', '\u001F', '\u008F', '\uD805', '\uFFFA')
+    for (weirdChar <- badChars) {
+      invalidTopicNames += "Is" + weirdChar + "funny"
+    }
+
+    for (i <- 0 until invalidTopicNames.size) {
+      try {
+        logManager.getOrCreateLog(invalidTopicNames(i), 0)
+        fail("Should throw InvalidTopicException.")
+      }
+      catch {
+        case e: InvalidTopicException => "This is good."
+      }
+    }
+  }
 
   @Test
   def testCleanupExpiredSegments() {
@@ -68,10 +105,13 @@ class LogManagerTest extends JUnitSuite {
       offset += set.sizeInBytes
     }
     log.flush
-    // Why this sleep is required ? File system takes some time to update the last modified time for a file.
-    // TODO: What is unknown is why 1 second or couple 100 milliseconds didn't work ?
-    Thread.sleep(2000)
+
     assertTrue("There should be more than one segment now.", log.numberOfSegments > 1)
+
+    // update the last modified time of all log segments
+    val logSegments = log.segments.view
+    logSegments.foreach(s => s.file.setLastModified(time.currentMs))
+
     time.currentMs += maxLogAge + 3000
     logManager.cleanupLogs()
     assertEquals("Now there should only be only one segment.", 1, log.numberOfSegments)
@@ -97,10 +137,11 @@ class LogManagerTest extends JUnitSuite {
     config = new KafkaConfig(props) {
       override val logFileSize = (10 * (setSize - 1)).asInstanceOf[Int] // each segment will be 10 messages
       override val enableZookeeper = false
-      override val logRetentionSize = (5 * 10 * setSize + 10).asInstanceOf[Int] // keep exactly 6 segments + 1 roll over
+      override val logRetentionSize = (5 * 10 * setSize + 10).asInstanceOf[Long]
       override val logRetentionHours = retentionHours
+      override val flushInterval = 100
     }
-    logManager = new LogManager(config, null, time, -1, retentionMs, false)
+    logManager = new LogManager(config, null, time, maxSegAge, -1, retentionMs, false)
     logManager.startup
 
     // create a log
@@ -117,12 +158,12 @@ class LogManagerTest extends JUnitSuite {
     log.flush
     Thread.sleep(2000)
 
-    // should be exactly 100 full segments + 1 new empty one
-    assertEquals("There should be example 101 segments.", 100 + 1, log.numberOfSegments)
+    // should be exactly 100 full segments
+    assertEquals("There should be example 100 segments.", 100, log.numberOfSegments)
 
     // this cleanup shouldn't find any expired segments but should delete some to reduce size
     logManager.cleanupLogs()
-    assertEquals("Now there should be exactly 7 segments", 6 + 1, log.numberOfSegments)
+    assertEquals("Now there should be exactly 6 segments", 6, log.numberOfSegments)
     assertEquals("Should get empty fetch off new log.", 0L, log.read(offset, 1024).sizeInBytes)
     try {
       log.read(0, 1024)
@@ -146,7 +187,7 @@ class LogManagerTest extends JUnitSuite {
                    override val flushInterval = Int.MaxValue
                    override val flushIntervalMap = Utils.getTopicFlushIntervals("timebasedflush:100")
                  }
-    logManager = new LogManager(config, null, time, -1, maxLogAge, false)
+    logManager = new LogManager(config, null, time, maxSegAge, -1, maxLogAge, false)
     logManager.startup
     val log = logManager.getOrCreateLog("timebasedflush", 0)
     for(i <- 0 until 200) {
@@ -167,9 +208,10 @@ class LogManagerTest extends JUnitSuite {
                    override val logFileSize = 256
                    override val enableZookeeper = false
                    override val topicPartitionsMap = Utils.getTopicPartitions("testPartition:2")
+                   override val flushInterval = 100
                  }
     
-    logManager = new LogManager(config, null, time, -1, maxLogAge, false)
+    logManager = new LogManager(config, null, time, maxSegAge, -1, maxLogAge, false)
     logManager.startup
     
     for(i <- 0 until 2) {

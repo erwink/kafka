@@ -17,17 +17,15 @@
 
 package kafka.log
 
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic._
 import java.text.NumberFormat
 import java.io._
-import java.nio.channels.FileChannel
-import org.apache.log4j._
 import kafka.message._
 import kafka.utils._
 import kafka.common._
 import kafka.api.OffsetRequest
 import java.util._
+import kafka.server.BrokerTopicStat
 
 private[log] object Log {
   val FileSuffix = ".kafka"
@@ -80,14 +78,35 @@ private[log] object Log {
     nf.setGroupingUsed(false)
     nf.format(offset) + Log.FileSuffix
   }
+  
+  def getEmptyOffsets(request: OffsetRequest): Array[Long] = {
+    if (request.time == OffsetRequest.LatestTime || request.time == OffsetRequest.EarliestTime)
+      return Array(0L)
+    else
+      return Array()
+  }
 }
 
 /**
  * A segment file in the log directory. Each log semgment consists of an open message set, a start offset and a size 
  */
-private[log] class LogSegment(val file: File, val messageSet: FileMessageSet, val start: Long) extends Range {
+private[log] class LogSegment(val file: File, val time: Time, val messageSet: FileMessageSet, val start: Long) extends Range {
+  var firstAppendTime: Option[Long] = None
   @volatile var deleted = false
   def size: Long = messageSet.highWaterMark
+
+  private def updateFirstAppendTime() {
+    if (firstAppendTime.isEmpty)
+      firstAppendTime = Some(time.milliseconds)
+  }
+
+  def append(messages: ByteBufferMessageSet) {
+    if (messages.sizeInBytes > 0) {
+      messageSet.append(messages)
+      updateFirstAppendTime()
+    }
+   }
+
   override def toString() = "(file=" + file + ", start=" + start + ", size=" + size + ")"
 }
 
@@ -96,10 +115,8 @@ private[log] class LogSegment(val file: File, val messageSet: FileMessageSet, va
  * An append-only log for storing messages. 
  */
 @threadsafe
-private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int, val needRecovery: Boolean) {
-
-  private val logger = Logger.getLogger(classOf[Log])
-
+private[log] class Log(val dir: File, val time: Time, val maxSize: Long, val maxMessageSize: Int,
+                       val flushInterval: Int, val rollIntervalMs: Long, val needRecovery: Boolean) extends Logging {
   /* A lock that guards all modifications to the log */
   private val lock = new Object
 
@@ -117,7 +134,7 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
 
   private val logStats = new LogStats(this)
 
-  Utils.registerMBean(logStats, "kafka:type=kafka.logs." + dir.getName)  
+  Utils.registerMBean(logStats, "kafka:type=kafka.logs." + dir.getName)
 
   /* Load the log segments from the log files on disk */
   private def loadSegments(): SegmentList[LogSegment] = {
@@ -131,7 +148,7 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
         val filename = file.getName()
         val start = filename.substring(0, filename.length - Log.FileSuffix.length).toLong
         val messageSet = new FileMessageSet(file, false)
-        accum.add(new LogSegment(file, messageSet, start))
+        accum.add(new LogSegment(file, time, messageSet, start))
       }
     }
 
@@ -139,7 +156,7 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
       // no existing segments, create a new mutable segment
       val newFile = new File(dir, Log.nameFromOffset(0))
       val set = new FileMessageSet(newFile, true)
-      accum.add(new LogSegment(newFile, set, 0))
+      accum.add(new LogSegment(newFile, time, set, 0))
     } else {
       // there is at least one existing segment, validate and recover them/it
       // sort segments into ascending order for fast searching
@@ -155,8 +172,8 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
       //make the final section mutable and run recovery on it if necessary
       val last = accum.remove(accum.size - 1)
       last.messageSet.close()
-      logger.info("Loading the last segment " + last.file.getAbsolutePath() + " in mutable mode, recovery " + needRecovery)
-      val mutable = new LogSegment(last.file, new FileMessageSet(last.file, true, new AtomicBoolean(needRecovery)), last.start)
+      info("Loading the last segment " + last.file.getAbsolutePath() + " in mutable mode, recovery " + needRecovery)
+      val mutable = new LogSegment(last.file, time, new FileMessageSet(last.file, true, new AtomicBoolean(needRecovery)), last.start)
       accum.add(mutable)
     }
     new SegmentList(accum.toArray(new Array[LogSegment](accum.size)))
@@ -196,8 +213,9 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
    * Append this message set to the active segment of the log, rolling over to a fresh segment if necessary.
    * Returns the offset at which the messages are written.
    */
-  def append(messages: MessageSet): Unit = {
+  def append(messages: ByteBufferMessageSet): Unit = {
     // validate the messages
+    messages.verifyMessageSize(maxMessageSize)
     var numberOfMessages = 0
     for(messageAndOffset <- messages) {
       if(!messageAndOffset.message.isValid)
@@ -205,16 +223,38 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
       numberOfMessages += 1;
     }
 
+    BrokerTopicStat.getBrokerTopicStat(getTopicName).recordMessagesIn(numberOfMessages)
+    BrokerTopicStat.getBrokerAllTopicStat.recordMessagesIn(numberOfMessages)
     logStats.recordAppendedMessages(numberOfMessages)
-    
+
+    // truncate the message set's buffer upto validbytes, before appending it to the on-disk log
+    val validByteBuffer = messages.getBuffer.duplicate()
+    val messageSetValidBytes = messages.validBytes
+    if(messageSetValidBytes > Int.MaxValue || messageSetValidBytes < 0)
+      throw new InvalidMessageSizeException("Illegal length of message set " + messageSetValidBytes +
+        " Message set cannot be appended to log. Possible causes are corrupted produce requests")
+
+    validByteBuffer.limit(messageSetValidBytes.asInstanceOf[Int])
+    val validMessages = new ByteBufferMessageSet(validByteBuffer)
+
     // they are valid, insert them in the log
     lock synchronized {
-      val segment = segments.view.last
-      segment.messageSet.append(messages)
-      maybeFlush(numberOfMessages)
-      maybeRoll(segment)
+      try {
+        var segment = segments.view.last
+        maybeRoll(segment)
+        segment = segments.view.last
+        segment.append(validMessages)
+        maybeFlush(numberOfMessages)
+      }
+      catch {
+        case e: IOException =>
+          fatal("Halting due to unrecoverable I/O error while handling producer request", e)
+          Runtime.getRuntime.halt(1)
+        case e2 => throw e2
+      }
     }
   }
+
 
   /**
    * Read from the log file at the given offset
@@ -236,10 +276,18 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
       val deletable = view.takeWhile(predicate)
       for(seg <- deletable)
         seg.deleted = true
-      val numToDelete = deletable.size
+      var numToDelete = deletable.size
       // if we are deleting everything, create a new empty segment
-      if(numToDelete == view.size)
-        roll()
+      if(numToDelete == view.size) {
+        if (view(numToDelete - 1).size > 0)
+          roll()
+        else {
+          // If the last segment to be deleted is empty and we roll the log, the new segment will have the same
+          // file name. So simply reuse the last segment and reset the modified time.
+          view(numToDelete - 1).file.setLastModified(SystemTime.milliseconds)
+          numToDelete -=1
+        }
+      }
       segments.trunc(numToDelete)
     }
   }
@@ -268,7 +316,8 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
    * Roll the log over if necessary
    */
   private def maybeRoll(segment: LogSegment) {
-    if(segment.messageSet.sizeInBytes > maxSize)
+    if((segment.messageSet.sizeInBytes > maxSize) ||
+       ((segment.firstAppendTime.isDefined) && (time.milliseconds - segment.firstAppendTime.get > rollIntervalMs)))
       roll()
   }
 
@@ -277,12 +326,14 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
    */
   def roll() {
     lock synchronized {
-      val last = segments.view.last
       val newOffset = nextAppendOffset
       val newFile = new File(dir, Log.nameFromOffset(newOffset))
-      if(logger.isDebugEnabled)
-        logger.debug("Rolling log '" + name + "' to " + newFile.getName())
-      segments.append(new LogSegment(newFile, new FileMessageSet(newFile, true), newOffset))
+      if (newFile.exists) {
+        warn("newly rolled logsegment " + newFile.getName + " already exists; deleting it first")
+        newFile.delete()
+      }
+      debug("Rolling log '" + name + "' to " + newFile.getName())
+      segments.append(new LogSegment(newFile, time, new FileMessageSet(newFile, true), newOffset))
     }
   }
 
@@ -302,8 +353,7 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
     if (unflushed.get == 0) return
 
     lock synchronized {
-      if(logger.isDebugEnabled)
-        logger.debug("Flushing log '" + name + "' last flushed: " + getLastFlushedTime + " current time: " +
+      debug("Flushing log '" + name + "' last flushed: " + getLastFlushedTime + " current time: " +
           System.currentTimeMillis)
       segments.view.last.messageSet.flush()
       unflushed.set(0)
@@ -332,9 +382,7 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
         startIndex = 0
       case _ =>
           var isFound = false
-          if(logger.isDebugEnabled) {
-            logger.debug("Offset time array = " + offsetTimeArray.foreach(o => "%d, %d".format(o._1, o._2)))
-          }
+          debug("Offset time array = " + offsetTimeArray.foreach(o => "%d, %d".format(o._1, o._2)))
           startIndex = offsetTimeArray.length - 1
           while (startIndex >= 0 && !isFound) {
             if (offsetTimeArray(startIndex)._2 <= request.time)
@@ -352,7 +400,7 @@ private[log] class Log(val dir: File, val maxSize: Long, val flushInterval: Int,
     }
     ret
   }
-
+ 
   def getTopicName():String = {
     name.substring(0, name.lastIndexOf("-"))
   }

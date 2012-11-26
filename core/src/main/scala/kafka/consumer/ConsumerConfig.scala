@@ -20,16 +20,16 @@ package kafka.consumer
 import java.util.Properties
 import kafka.utils.{ZKConfig, Utils}
 import kafka.api.OffsetRequest
-import kafka.common.InvalidConfigException
 object ConsumerConfig {
   val SocketTimeout = 30 * 1000
   val SocketBufferSize = 64*1024
-  val FetchSize = 300 * 1024
+  val FetchSize = 1024 * 1024
   val MaxFetchSize = 10*FetchSize
-  val BackoffIncrementMs = 1000
+  val DefaultFetcherBackoffMs = 1000
   val AutoCommit = true
   val AutoCommitInterval = 10 * 1000
-  val MaxQueuedChunks = 100
+  val MaxQueuedChunks = 10
+  val MaxRebalanceRetries = 4
   val AutoOffsetReset = OffsetRequest.SmallestTimeString
   val ConsumerTimeoutMs = -1
   val MirrorTopicsWhitelist = ""
@@ -61,12 +61,9 @@ class ConsumerConfig(props: Properties) extends ZKConfig(props) {
   /** the number of byes of messages to attempt to fetch */
   val fetchSize = Utils.getInt(props, "fetch.size", FetchSize)
   
-  /** the maximum allowable fetch size for a very large message */
-  val maxFetchSize: Int = fetchSize * 10
-  
   /** to avoid repeatedly polling a broker node which has no new data
       we will backoff every time we get an empty set from the broker*/
-  val backoffIncrementMs: Long = Utils.getInt(props, "backoff.increment.ms", BackoffIncrementMs)
+  val fetcherBackoffMs: Long = Utils.getInt(props, "fetcher.backoff.ms", DefaultFetcherBackoffMs)
   
   /** if true, periodically commit to zookeeper the offset of messages already fetched by the consumer */
   val autoCommit = Utils.getBoolean(props, "autocommit.enable", AutoCommit)
@@ -77,6 +74,12 @@ class ConsumerConfig(props: Properties) extends ZKConfig(props) {
   /** max number of messages buffered for consumption */
   val maxQueuedChunks = Utils.getInt(props, "queuedchunks.max", MaxQueuedChunks)
 
+  /** max number of retries during rebalance */
+  val maxRebalanceRetries = Utils.getInt(props, "rebalance.retries.max", MaxRebalanceRetries)
+
+  /** backoff time between retries during rebalance */
+  val rebalanceBackoffMs = Utils.getInt(props, "rebalance.backoff.ms", zkSyncTimeMs)
+
   /* what to do if an offset is out of range.
      smallest : automatically reset the offset to the smallest offset
      largest : automatically reset the offset to the largest offset
@@ -86,20 +89,10 @@ class ConsumerConfig(props: Properties) extends ZKConfig(props) {
   /** throw a timeout exception to the consumer if no message is available for consumption after the specified interval */
   val consumerTimeoutMs = Utils.getInt(props, "consumer.timeout.ms", ConsumerTimeoutMs)
 
-  /** Whitelist of topics for this mirror's embedded consumer to consume. At
-   *  most one of whitelist/blacklist may be specified. */
-  val mirrorTopicsWhitelist = Utils.getString(
-    props, MirrorTopicsWhitelistProp, MirrorTopicsWhitelist)
- 
-  /** Topics to skip mirroring. At most one of whitelist/blacklist may be
-   *  specified */
-  val mirrorTopicsBlackList = Utils.getString(
-    props, MirrorTopicsBlacklistProp, MirrorTopicsBlacklist)
-
-  if (mirrorTopicsWhitelist.nonEmpty && mirrorTopicsBlackList.nonEmpty)
-      throw new InvalidConfigException("The embedded consumer's mirror topics configuration can only contain one of blacklist or whitelist")
-
-  val mirrorConsumerNumThreads = Utils.getInt(
-    props, MirrorConsumerNumThreadsProp, MirrorConsumerNumThreads)
+  /** Use shallow iterator over compressed messages directly. This feature should be used very carefully.
+   *  Typically, it's only used for mirroring raw messages from one kafka cluster to another to save the
+   *  overhead of decompression.
+   *  */
+  val enableShallowIterator = Utils.getBoolean(props, "shallowiterator.enable", false)
 }
 

@@ -18,9 +18,8 @@
 package kafka.tools
 
 import joptsimple._
-import kafka.utils.Utils
+import kafka.utils.{Utils, Logging}
 import java.util.concurrent.CountDownLatch
-import org.apache.log4j.Logger
 import kafka.consumer._
 import kafka.serializer.StringDecoder
 
@@ -28,7 +27,6 @@ import kafka.serializer.StringDecoder
  * Program to read using the rich consumer and dump the results to standard out
  */
 object ConsumerShell {
-  val logger = Logger.getLogger(getClass)
   def main(args: Array[String]): Unit = {
     
     val parser = new OptionParser
@@ -84,21 +82,20 @@ object ConsumerShell {
   }
 }
 
-class ZKConsumerThread(stream: KafkaMessageStream[String]) extends Thread {
+class ZKConsumerThread(stream: KafkaStream[String]) extends Thread with Logging {
   val shutdownLatch = new CountDownLatch(1)
-  val logger = Logger.getLogger(getClass)
 
   override def run() {
     println("Starting consumer thread..")
     var count: Int = 0
     try {
-      for (message <- stream) {
-        println("consumed: " + message)
+      for (messageAndMetadata <- stream) {
+        println("consumed: " + messageAndMetadata.message)
         count += 1
       }
     }catch {
       case e:ConsumerTimeoutException => // this is ok
-      case oe: Exception => logger.error("error in ZKConsumerThread", oe)
+      case oe: Exception => error("error in ZKConsumerThread", oe)
     }
     shutdownLatch.countDown
     println("Received " + count + " messages")

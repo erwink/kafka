@@ -20,13 +20,11 @@ import kafka.utils.TestUtils
 import java.io.File
 import kafka.utils.Utils
 import kafka.api.FetchRequest
-import kafka.integration.ProducerConsumerTestHarness
 import kafka.producer.{SyncProducer, SyncProducerConfig}
 import kafka.consumer.SimpleConsumer
 import java.util.Properties
 import org.scalatest.junit.JUnitSuite
-import junit.framework.{Assert, TestCase}
-import org.junit.{After, Before, Test}
+import org.junit.Test
 import junit.framework.Assert._
 import kafka.message.{NoCompressionCodec, Message, ByteBufferMessageSet}
 
@@ -68,6 +66,7 @@ class ServerShutdownTest extends JUnitSuite {
       server.shutdown()
       val cleanShutDownFile = new File(new File(config.logDir), server.CLEAN_SHUTDOWN_FILE)
       assertTrue(cleanShutDownFile.exists)
+      producer.close()
     }
 
 
@@ -105,6 +104,7 @@ class ServerShutdownTest extends JUnitSuite {
 
       server.shutdown()
       Utils.rm(server.config.logDir)
+      producer.close()
     }
 
   }

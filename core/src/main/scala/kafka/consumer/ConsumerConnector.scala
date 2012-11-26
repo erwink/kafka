@@ -18,8 +18,7 @@
 package kafka.consumer
 
 import scala.collection._
-import kafka.utils.Utils
-import org.apache.log4j.Logger
+import kafka.utils.{Utils, Logging}
 import kafka.serializer.{DefaultDecoder, Decoder}
 
 /**
@@ -30,12 +29,28 @@ trait ConsumerConnector {
    *  Create a list of MessageStreams for each topic.
    *
    *  @param topicCountMap  a map of (topic, #streams) pair
-   *  @return a map of (topic, list of  KafkaMessageStream) pair. The number of items in the
-   *          list is #streams. Each KafkaMessageStream supports an iterator of messages.
+   *  @param decoder Decoder to decode each Message to type T
+   *  @return a map of (topic, list of  KafkaStream) pairs.
+   *          The number of items in the list is #streams. Each stream supports
+   *          an iterator over message/metadata pairs.
    */
   def createMessageStreams[T](topicCountMap: Map[String,Int],
                               decoder: Decoder[T] = new DefaultDecoder)
-    : Map[String,List[KafkaMessageStream[T]]]
+    : Map[String,List[KafkaStream[T]]]
+
+  /**
+   *  Create a list of message streams for all topics that match a given filter.
+   *
+   *  @param topicFilter Either a Whitelist or Blacklist TopicFilter object.
+   *  @param numStreams Number of streams to return
+   *  @param decoder Decoder to decode each Message to type T
+   *  @return a list of KafkaStream each of which provides an
+   *          iterator over message/metadata pairs over allowed topics.
+   */
+  def createMessageStreamsByFilter[T](topicFilter: TopicFilter,
+                                      numStreams: Int = 1,
+                                      decoder: Decoder[T] = new DefaultDecoder)
+    : Seq[KafkaStream[T]]
 
   /**
    *  Commit the offsets of all broker partitions connected by this connector.
@@ -48,8 +63,7 @@ trait ConsumerConnector {
   def shutdown()
 }
 
-object Consumer {
-  private val logger = Logger.getLogger(getClass())  
+object Consumer extends Logging {
   private val consumerStatsMBeanName = "kafka:type=kafka.ConsumerStats"
 
   /**
@@ -60,7 +74,7 @@ object Consumer {
    */
   def create(config: ConsumerConfig): ConsumerConnector = {
     val consumerConnect = new ZookeeperConsumerConnector(config)
-    Utils.swallow(logger.warn, Utils.registerMBean(consumerConnect, consumerStatsMBeanName))
+    Utils.registerMBean(consumerConnect, consumerStatsMBeanName + ",groupid=" + config.groupId)
     consumerConnect
   }
 
@@ -72,7 +86,7 @@ object Consumer {
    */
   def createJavaConsumerConnector(config: ConsumerConfig): kafka.javaapi.consumer.ConsumerConnector = {
     val consumerConnect = new kafka.javaapi.consumer.ZookeeperConsumerConnector(config)
-    Utils.swallow(logger.warn, Utils.registerMBean(consumerConnect.underlying, consumerStatsMBeanName))
+    Utils.registerMBean(consumerConnect.underlying, consumerStatsMBeanName + ",groupid=" + config.groupId)
     consumerConnect
   }
 }

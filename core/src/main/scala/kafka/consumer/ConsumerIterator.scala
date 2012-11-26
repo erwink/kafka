@@ -5,7 +5,7 @@
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- * 
+ *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
@@ -17,72 +17,84 @@
 
 package kafka.consumer
 
-import kafka.utils.IteratorTemplate
-import org.apache.log4j.Logger
+import kafka.utils.{IteratorTemplate, Logging}
 import java.util.concurrent.{TimeUnit, BlockingQueue}
-import kafka.cluster.Partition
-import kafka.message.{MessageAndOffset, MessageSet, Message}
 import kafka.serializer.Decoder
+import java.util.concurrent.atomic.AtomicReference
+import kafka.message.{MessageAndOffset, MessageAndMetadata}
+
 
 /**
  * An iterator that blocks until a value can be read from the supplied queue.
  * The iterator takes a shutdownCommand object which can be added to the queue to trigger a shutdown
- * 
+ *
  */
-class ConsumerIterator[T](private val topic: String,
-                          private val channel: BlockingQueue[FetchedDataChunk],
+class ConsumerIterator[T](private val channel: BlockingQueue[FetchedDataChunk],
                           consumerTimeoutMs: Int,
-                          private val decoder: Decoder[T])
-        extends IteratorTemplate[T] {
-  
-  private val logger = Logger.getLogger(classOf[ConsumerIterator[T]])
-  private var current: Iterator[MessageAndOffset] = null
-  private var currentDataChunk: FetchedDataChunk = null
-  private var currentTopicInfo: PartitionTopicInfo = null
+                          private val decoder: Decoder[T],
+                          val enableShallowIterator: Boolean)
+  extends IteratorTemplate[MessageAndMetadata[T]] with Logging {
+
+  private var current: AtomicReference[Iterator[MessageAndOffset]] = new AtomicReference(null)
+  private var currentTopicInfo:PartitionTopicInfo = null
   private var consumedOffset: Long = -1L
 
-  override def next(): T = {
-    val decodedMessage = super.next()
+  override def next(): MessageAndMetadata[T] = {
+    val item = super.next()
     if(consumedOffset < 0)
       throw new IllegalStateException("Offset returned by the message set is invalid %d".format(consumedOffset))
     currentTopicInfo.resetConsumeOffset(consumedOffset)
-    if(logger.isTraceEnabled)
-      logger.trace("Setting consumed offset to %d".format(consumedOffset))
+    val topic = currentTopicInfo.topic
+    trace("Setting %s consumed offset to %d".format(topic, consumedOffset))
     ConsumerTopicStat.getConsumerTopicStat(topic).recordMessagesPerTopic(1)
-    decodedMessage
+    ConsumerTopicStat.getConsumerAllTopicStat().recordMessagesPerTopic(1)
+    item
   }
 
-  protected def makeNext(): T = {
+  protected def makeNext(): MessageAndMetadata[T] = {
+    var currentDataChunk: FetchedDataChunk = null
     // if we don't have an iterator, get one
-    if(current == null || !current.hasNext) {
+    var localCurrent = current.get()
+    if(localCurrent == null || !localCurrent.hasNext) {
       if (consumerTimeoutMs < 0)
         currentDataChunk = channel.take
       else {
         currentDataChunk = channel.poll(consumerTimeoutMs, TimeUnit.MILLISECONDS)
         if (currentDataChunk == null) {
+          // reset state to make the iterator re-iterable
+          resetState()
           throw new ConsumerTimeoutException
         }
       }
       if(currentDataChunk eq ZookeeperConsumerConnector.shutdownCommand) {
-        if(logger.isDebugEnabled)
-          logger.debug("Received the shutdown command")
+        debug("Received the shutdown command")
         channel.offer(currentDataChunk)
         return allDone
       } else {
         currentTopicInfo = currentDataChunk.topicInfo
         if (currentTopicInfo.getConsumeOffset != currentDataChunk.fetchOffset) {
-          logger.error("consumed offset: %d doesn't match fetch offset: %d for %s;\n Consumer may lose data"
+          error("consumed offset: %d doesn't match fetch offset: %d for %s;\n Consumer may lose data"
                         .format(currentTopicInfo.getConsumeOffset, currentDataChunk.fetchOffset, currentTopicInfo))
           currentTopicInfo.resetConsumeOffset(currentDataChunk.fetchOffset)
         }
-        current = currentDataChunk.messages.iterator
+        localCurrent = if (enableShallowIterator) currentDataChunk.messages.shallowIterator
+                       else currentDataChunk.messages.iterator
+        current.set(localCurrent)
       }
     }
-    val item = current.next()
+    val item = localCurrent.next()
     consumedOffset = item.offset
-    decoder.toEvent(item.message)
+
+    new MessageAndMetadata(decoder.toEvent(item.message), currentTopicInfo.topic)
   }
-  
+
+  def clearCurrentChunk() {
+    try {
+      info("Clearing the current data chunk for this consumer iterator")
+      current.set(null)
+    }
+  }
 }
 
 class ConsumerTimeoutException() extends RuntimeException()
+

@@ -23,13 +23,12 @@ import kafka.cluster.{Broker, Cluster}
 import scala.collection._
 import java.util.Properties
 import org.I0Itec.zkclient.exception.{ZkNodeExistsException, ZkNoNodeException, ZkMarshallingError}
-import org.apache.log4j.Logger
+import kafka.consumer.TopicCount
 
-object ZkUtils {
+object ZkUtils extends Logging {
   val ConsumersPath = "/consumers"
   val BrokerIdsPath = "/brokers/ids"
   val BrokerTopicsPath = "/brokers/topics"
-  private val logger = Logger.getLogger(getClass())  
 
   /**
    *  make sure a persistent path exists in ZK. Create the path if not exist.
@@ -83,12 +82,12 @@ object ZkUtils {
           case e2 => throw e2
         }
         if (storedData == null || storedData != data) {
-          logger.info("conflict in " + path + " data: " + data + " stored data: " + storedData)
+          info("conflict in " + path + " data: " + data + " stored data: " + storedData)
           throw e
         }
         else {
           // otherwise, the creation succeeded, return normally
-          logger.info(path + " exists with value " + data + " during connection loss; this is ok")
+          info(path + " exists with value " + data + " during connection loss; this is ok")
         }
       }
       case e2 => throw e2
@@ -142,7 +141,7 @@ object ZkUtils {
     catch {
       case e: ZkNoNodeException =>
         // this can happen during a connection loss event, return normally
-        logger.info(path + " deleted during connection loss; this is ok")
+        info(path + " deleted during connection loss; this is ok")
       case e2 => throw e2
     }
   }
@@ -154,7 +153,7 @@ object ZkUtils {
     catch {
       case e: ZkNoNodeException =>
         // this can happen during a connection loss event, return normally
-        logger.info(path + " deleted during connection loss; this is ok")
+        info(path + " deleted during connection loss; this is ok")
       case e2 => throw e2
     }
   }
@@ -237,6 +236,38 @@ object ZkUtils {
     zkClient.delete(brokerIdPath)
     val brokerPartTopicPath = BrokerTopicsPath + "/" + topic + "/" + brokerId
     zkClient.delete(brokerPartTopicPath)
+  }
+
+  def getConsumersInGroup(zkClient: ZkClient, group: String): Seq[String] = {
+    val dirs = new ZKGroupDirs(group)
+    getChildren(zkClient, dirs.consumerRegistryDir)
+  }
+
+  def getConsumerTopicMaps(zkClient: ZkClient, group: String): Map[String, TopicCount] = {
+    val dirs = new ZKGroupDirs(group)
+    val consumersInGroup = getConsumersInGroup(zkClient, group)
+    val topicCountMaps = consumersInGroup.map(consumerId => TopicCount.constructTopicCount(consumerId,
+      ZkUtils.readData(zkClient, dirs.consumerRegistryDir + "/" + consumerId), zkClient))
+    consumersInGroup.zip(topicCountMaps).toMap
+  }
+
+  def getConsumersPerTopic(zkClient: ZkClient, group: String) : mutable.Map[String, List[String]] = {
+    val dirs = new ZKGroupDirs(group)
+    val consumers = getChildrenParentMayNotExist(zkClient, dirs.consumerRegistryDir)
+    val consumersPerTopicMap = new mutable.HashMap[String, List[String]]
+    for (consumer <- consumers) {
+      val topicCount = TopicCount.constructTopicCount(group, consumer, zkClient)
+      for ((topic, consumerThreadIdSet) <- topicCount.getConsumerThreadIdsPerTopic) {
+        for (consumerThreadId <- consumerThreadIdSet)
+          consumersPerTopicMap.get(topic) match {
+            case Some(curConsumers) => consumersPerTopicMap.put(topic, consumerThreadId :: curConsumers)
+            case _ => consumersPerTopicMap.put(topic, List(consumerThreadId))
+          }
+      }
+    }
+    for ( (topic, consumerList) <- consumersPerTopicMap )
+      consumersPerTopicMap.put(topic, consumerList.sortWith((s,t) => s < t))
+    consumersPerTopicMap
   }
 }
 

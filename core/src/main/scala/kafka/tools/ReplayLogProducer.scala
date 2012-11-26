@@ -17,28 +17,23 @@
 
 package kafka.tools
 
-import java.io.File
 import joptsimple.OptionParser
-import org.apache.log4j.Logger
 import java.util.concurrent.{Executors, CountDownLatch}
 import java.util.Properties
 import kafka.producer.async.DefaultEventHandler
-import kafka.serializer.{DefaultEncoder, StringEncoder}
+import kafka.serializer.DefaultEncoder
 import kafka.producer.{ProducerData, DefaultPartitioner, ProducerConfig, Producer}
 import kafka.consumer._
-import kafka.utils.{ZKStringSerializer, Utils}
+import kafka.utils.{ZKStringSerializer, Logging}
 import kafka.api.OffsetRequest
 import org.I0Itec.zkclient._
-import kafka.message.{CompressionCodec, Message, MessageSet, FileMessageSet}
+import kafka.message.{CompressionCodec, Message}
 
-object ReplayLogProducer {
+object ReplayLogProducer extends Logging {
 
   private val GROUPID: String = "replay-log-producer"
-  private val logger = Logger.getLogger(getClass)
 
   def main(args: Array[String]) {
-    var isNoPrint = false;
-
     val config = new Config(args)
 
     val executor = Executors.newFixedThreadPool(config.numThreads)
@@ -147,7 +142,7 @@ object ReplayLogProducer {
   def tryCleanupZookeeper(zkUrl: String, groupId: String) {
     try {
       val dir = "/consumers/" + groupId
-      logger.info("Cleaning up temporary zookeeper data under " + dir + ".")
+      info("Cleaning up temporary zookeeper data under " + dir + ".")
       val zk = new ZkClient(zkUrl, 30*1000, 30*1000, ZKStringSerializer)
       zk.deleteRecursive(dir)
       zk.close()
@@ -156,9 +151,8 @@ object ReplayLogProducer {
     }
   }
 
-  class ZKConsumerThread(config: Config, stream: KafkaMessageStream[Message]) extends Thread {
+  class ZKConsumerThread(config: Config, stream: KafkaStream[Message]) extends Thread with Logging {
     val shutdownLatch = new CountDownLatch(1)
-    val logger = Logger.getLogger(getClass)
     val props = new Properties()
     val brokerInfoList = config.brokerInfo.split("=")
     if (brokerInfoList(0) == "zk.connect")
@@ -169,7 +163,8 @@ object ReplayLogProducer {
     props.put("buffer.size", (64*1024).toString)
     props.put("compression.codec", config.compressionCodec.codec.toString)
     props.put("batch.size", config.batchSize.toString)
-
+    props.put("queue.enqueueTimeout.ms", "-1")
+    
     if(config.isAsync)
       props.put("producer.type", "async")
 
@@ -179,7 +174,7 @@ object ReplayLogProducer {
                                                   null, new DefaultPartitioner[Message])
 
     override def run() {
-      logger.info("Starting consumer thread..")
+      info("Starting consumer thread..")
       var messageCount: Int = 0
       try {
         val iter =
@@ -187,22 +182,22 @@ object ReplayLogProducer {
             stream.slice(0, config.numMessages)
           else
             stream
-        for (message <- iter) {
+        for (messageAndMetadata <- iter) {
           try {
-            producer.send(new ProducerData[Message, Message](config.outputTopic, message))
+            producer.send(new ProducerData[Message, Message](config.outputTopic, messageAndMetadata.message))
             if (config.delayedMSBtwSend > 0 && (messageCount + 1) % config.batchSize == 0)
               Thread.sleep(config.delayedMSBtwSend)
             messageCount += 1
           }catch {
-            case ie: Exception => logger.error("Skipping this message", ie)
+            case ie: Exception => error("Skipping this message", ie)
           }
         }
       }catch {
-        case e: ConsumerTimeoutException => logger.error("consumer thread timing out", e)
+        case e: ConsumerTimeoutException => error("consumer thread timing out", e)
       }
-      logger.info("Sent " + messageCount + " messages")
+      info("Sent " + messageCount + " messages")
       shutdownLatch.countDown
-      logger.info("thread finished execution !" )
+      info("thread finished execution !" )
     }
 
     def shutdown() {

@@ -24,33 +24,40 @@ import kafka.network._
 import kafka.utils._
 import kafka.api._
 import scala.math._
-import org.apache.log4j.{Level, Logger}
-import kafka.common.MessageSizeTooLargeException
 import java.nio.ByteBuffer
+import java.util.Random
 
 object SyncProducer {
   val RequestKey: Short = 0
+  val randomGenerator = new Random
 }
 
 /*
  * Send a message set.
  */
 @threadsafe
-class SyncProducer(val config: SyncProducerConfig) {
+class SyncProducer(val config: SyncProducerConfig) extends Logging {
   
-  private val logger = Logger.getLogger(getClass())
   private val MaxConnectBackoffMs = 60000
   private var channel : SocketChannel = null
   private var sentOnConnection = 0
+  /** make time-based reconnect starting at a random time **/
+  private var lastConnectionTime = System.currentTimeMillis - SyncProducer.randomGenerator.nextDouble() * config.reconnectInterval
+
   private val lock = new Object()
   @volatile
   private var shutdown: Boolean = false
 
-  logger.debug("Instantiating Scala Sync Producer")
+  trace("Instantiating Scala Sync Producer")
 
   private def verifySendBuffer(buffer : ByteBuffer) = {
-    if (logger.isTraceEnabled) {
-      logger.trace("verifying sendbuffer of size " + buffer.limit)
+    /**
+     * This seems a little convoluted, but the idea is to turn on verification simply changing log4j settings
+     * Also, when verification is turned on, care should be taken to see that the logs don't fill up with unnecessary
+     * data. So, leaving the rest of the logging at TRACE, while errors should be logged at ERROR level
+     */
+    if (logger.isDebugEnabled) {
+      trace("verifying sendbuffer of size " + buffer.limit)
       val requestTypeId = buffer.getShort()
       if (requestTypeId == RequestKeys.MultiProduce) {
         try {
@@ -59,17 +66,17 @@ class SyncProducer(val config: SyncProducerConfig) {
             try {
               for (messageAndOffset <- produce.messages)
                 if (!messageAndOffset.message.isValid)
-                  logger.trace("topic " + produce.topic + " is invalid")
+                  throw new InvalidMessageException("Message for topic " + produce.topic + " is invalid")
             }
             catch {
               case e: Throwable =>
-              logger.trace("error iterating messages " + e + Utils.stackTrace(e))
+                error("error iterating messages ", e)
             }
           }
         }
         catch {
           case e: Throwable =>
-            logger.trace("error verifying sendbuffer " + e + Utils.stackTrace(e))
+            error("error verifying sendbuffer ", e)
         }
       }
     }
@@ -96,10 +103,12 @@ class SyncProducer(val config: SyncProducerConfig) {
       }
       // TODO: do we still need this?
       sentOnConnection += 1
-      if(sentOnConnection >= config.reconnectInterval) {
+
+      if(sentOnConnection >= config.reconnectInterval || (config.reconnectTimeInterval >= 0 && System.currentTimeMillis - lastConnectionTime >= config.reconnectTimeInterval)) {
         disconnect()
         channel = connect()
         sentOnConnection = 0
+        lastConnectionTime = System.currentTimeMillis
       }
       val endTime = SystemTime.nanoseconds
       SyncProducerStats.recordProduceRequest(endTime - startTime)
@@ -110,10 +119,9 @@ class SyncProducer(val config: SyncProducerConfig) {
    * Send a message
    */
   def send(topic: String, partition: Int, messages: ByteBufferMessageSet) {
-    verifyMessageSize(messages)
+    messages.verifyMessageSize(config.maxMessageSize)
     val setSize = messages.sizeInBytes.asInstanceOf[Int]
-    if(logger.isTraceEnabled)
-      logger.trace("Got message set with " + setSize + " bytes to send")
+    trace("Got message set with " + setSize + " bytes to send")
     send(new BoundedByteBufferSend(new ProducerRequest(topic, partition, messages)))
   }
  
@@ -121,10 +129,9 @@ class SyncProducer(val config: SyncProducerConfig) {
 
   def multiSend(produces: Array[ProducerRequest]) {
     for (request <- produces)
-      verifyMessageSize(request.messages)
+      request.messages.verifyMessageSize(config.maxMessageSize)
     val setSize = produces.foldLeft(0L)(_ + _.messages.sizeInBytes)
-    if(logger.isTraceEnabled)
-      logger.trace("Got multi message sets with " + setSize + " bytes to send")
+    trace("Got multi message sets with " + setSize + " bytes to send")
     send(new BoundedByteBufferSend(new MultiProducerRequest(produces)))
   }
 
@@ -135,11 +142,6 @@ class SyncProducer(val config: SyncProducerConfig) {
     }
   }
 
-  private def verifyMessageSize(messages: ByteBufferMessageSet) {
-    for (messageAndOffset <- messages)
-      if (messageAndOffset.message.payloadSize > config.maxMessageSize)
-        throw new MessageSizeTooLargeException
-  }
 
   /**
    * Disconnect from current channel, closing connection.
@@ -148,18 +150,17 @@ class SyncProducer(val config: SyncProducerConfig) {
   private def disconnect() {
     try {
       if(channel != null) {
-        logger.info("Disconnecting from " + config.host + ":" + config.port)
+        info("Disconnecting from " + config.host + ":" + config.port)
         Utils.swallow(logger.warn, channel.close())
         Utils.swallow(logger.warn, channel.socket.close())
         channel = null
       }
     } catch {
-      case e: Exception => logger.error("Error on disconnect: ", e)
+      case e: Exception => error("Error on disconnect: ", e)
     }
   }
     
   private def connect(): SocketChannel = {
-    var channel: SocketChannel = null
     var connectBackoffMs = 1
     val beginTimeMs = SystemTime.milliseconds
     while(channel == null && !shutdown) {
@@ -170,7 +171,7 @@ class SyncProducer(val config: SyncProducerConfig) {
         channel.socket.setSoTimeout(config.socketTimeoutMs)
         channel.socket.setKeepAlive(true)
         channel.connect(new InetSocketAddress(config.host, config.port))
-        logger.info("Connected to " + config.host + ":" + config.port + " for producing")
+        info("Connected to " + config.host + ":" + config.port + " for producing")
       }
       catch {
         case e: Exception => {
@@ -178,10 +179,10 @@ class SyncProducer(val config: SyncProducerConfig) {
           val endTimeMs = SystemTime.milliseconds
           if ( (endTimeMs - beginTimeMs + connectBackoffMs) > config.connectTimeoutMs)
           {
-            logger.error("Producer connection timing out after " + config.connectTimeoutMs + " ms", e)
+            error("Producer connection to " +  config.host + ":" + config.port + " timing out after " + config.connectTimeoutMs + " ms", e)
             throw e
           }
-          logger.error("Connection attempt failed, next attempt in " + connectBackoffMs + " ms", e)
+          error("Connection attempt to " +  config.host + ":" + config.port + " failed, next attempt in " + connectBackoffMs + " ms", e)
           SystemTime.sleep(connectBackoffMs)
           connectBackoffMs = min(10 * connectBackoffMs, MaxConnectBackoffMs)
         }
@@ -219,8 +220,7 @@ class SyncProducerStats extends SyncProducerStatsMBean {
   def getNumProduceRequests: Long = produceRequestStats.getNumRequests
 }
 
-object SyncProducerStats {
-  private val logger = Logger.getLogger(getClass())
+object SyncProducerStats extends Logging {
   private val kafkaProducerstatsMBeanName = "kafka:type=kafka.KafkaProducerStats"
   private val stats = new SyncProducerStats
   Utils.swallow(logger.warn, Utils.registerMBean(stats, kafkaProducerstatsMBeanName))

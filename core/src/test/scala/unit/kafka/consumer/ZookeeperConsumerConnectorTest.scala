@@ -22,15 +22,14 @@ import kafka.zk.ZooKeeperTestHarness
 import kafka.integration.KafkaServerTestHarness
 import kafka.server.KafkaConfig
 import scala.collection._
-import kafka.utils.Utils
+import kafka.utils.{Utils, Logging}
 import kafka.utils.{TestZKUtils, TestUtils}
 import org.scalatest.junit.JUnit3Suite
 import org.apache.log4j.{Level, Logger}
 import kafka.message._
 import kafka.serializer.StringDecoder
 
-class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHarness with ZooKeeperTestHarness {
-  private val logger = Logger.getLogger(getClass())
+class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHarness with ZooKeeperTestHarness with Logging {
 
   val zookeeperConnect = TestZKUtils.zookeeperConnect
   val zkConnect = zookeeperConnect
@@ -64,15 +63,20 @@ class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHar
     }
     val zkConsumerConnector0 = new ZookeeperConsumerConnector(consumerConfig0, true)
     val topicMessageStreams0 = zkConsumerConnector0.createMessageStreams(Predef.Map(topic -> numNodes*numParts/2))
-    try {
-      getMessages(nMessages*2, topicMessageStreams0)
-      fail("should get an exception")
+
+    // no messages to consume, we should hit timeout;
+    // also the iterator should support re-entrant, so loop it twice
+    for (i <- 0 until  2) {
+      try {
+        getMessages(nMessages*2, topicMessageStreams0)
+        fail("should get an exception")
+      }
+      catch {
+        case e: ConsumerTimeoutException => // this is ok
+        case e => throw e
+      }
     }
-    catch {
-      case e: ConsumerTimeoutException => // this is ok
-        println("This is ok")
-      case e => throw e
-    }
+
     zkConsumerConnector0.shutdown
 
     // send some messages to each broker
@@ -117,7 +121,7 @@ class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHar
     zkConsumerConnector1.shutdown
     zkConsumerConnector2.shutdown
     zkConsumerConnector3.shutdown
-    logger.info("all consumer connectors stopped")
+    info("all consumer connectors stopped")
     requestHandlerLogger.setLevel(Level.ERROR)
   }
 
@@ -170,7 +174,7 @@ class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHar
     zkConsumerConnector1.shutdown
     zkConsumerConnector2.shutdown
     zkConsumerConnector3.shutdown
-    logger.info("all consumer connectors stopped")
+    info("all consumer connectors stopped")
     requestHandlerLogger.setLevel(Level.ERROR)
   }
 
@@ -230,9 +234,9 @@ class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHar
         val iterator = messageStream.iterator
         for (i <- 0 until nMessages * 2) {
           assertTrue(iterator.hasNext())
-          val message = iterator.next()
+          val message = iterator.next().message
           receivedMessages ::= message
-          logger.debug("received message: " + message)
+          debug("received message: " + message)
         }
       }
     }
@@ -266,16 +270,16 @@ class ZookeeperConsumerConnectorTest extends JUnit3Suite with KafkaServerTestHar
     messages.sortWith((s,t) => s.checksum < t.checksum)
   }
 
-  def getMessages(nMessagesPerThread: Int, topicMessageStreams: Map[String,List[KafkaMessageStream[Message]]]): List[Message]= {
+  def getMessages(nMessagesPerThread: Int, topicMessageStreams: Map[String,List[KafkaStream[Message]]]): List[Message]= {
     var messages: List[Message] = Nil
     for ((topic, messageStreams) <- topicMessageStreams) {
       for (messageStream <- messageStreams) {
         val iterator = messageStream.iterator
         for (i <- 0 until nMessagesPerThread) {
           assertTrue(iterator.hasNext)
-          val message = iterator.next
+          val message = iterator.next.message
           messages ::= message
-          logger.debug("received message: " + Utils.toString(message.payload, "UTF-8"))
+          debug("received message: " + Utils.toString(message.payload, "UTF-8"))
         }
       }
     }

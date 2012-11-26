@@ -23,19 +23,19 @@ import java.nio.channels._
 import java.util.concurrent.atomic._
 import java.lang.management._
 import java.util.zip.CRC32
-import org.apache.log4j.Logger
 import javax.management._
 import java.util.Properties
 import scala.collection._
 import scala.collection.mutable
 import kafka.message.{NoCompressionCodec, CompressionCodec}
+import org.I0Itec.zkclient.ZkClient
+import joptsimple.{OptionSpec, OptionSet, OptionParser}
+import util.parsing.json.JSON
 
 /**
  * Helper functions!
  */
-object Utils {
-  private val logger = Logger.getLogger(getClass())
-  
+object Utils extends Logging {
   /**
    * Wrap the given function in a java.lang.Runnable
    * @param fun A function
@@ -60,8 +60,7 @@ object Utils {
         catch {
           case t =>
             // log any error and the stack trace
-            logger.error(t, t)
-            logger.error(stackTrace(t), t)
+            error("error in loggedRunnable", t)
         }
       }
     }
@@ -195,6 +194,48 @@ object Utils {
       v
   }
   
+  /**
+   * Read a required long property value or throw an exception if no such property is found
+   */
+  def getLong(props: Properties, name: String): Long = {
+    if(props.containsKey(name))
+      return getLong(props, name, -1)
+    else
+      throw new IllegalArgumentException("Missing required property '" + name + "'")
+  }
+
+  /**
+   * Read an long from the properties instance
+   * @param props The properties to read from
+   * @param name The property name
+   * @param default The default value to use if the property is not found
+   * @return the long value
+   */
+  def getLong(props: Properties, name: String, default: Long): Long = 
+    getLongInRange(props, name, default, (Long.MinValue, Long.MaxValue))
+
+  /**
+   * Read an long from the properties instance. Throw an exception 
+   * if the value is not in the given range (inclusive)
+   * @param props The properties to read from
+   * @param name The property name
+   * @param default The default value to use if the property is not found
+   * @param range The range in which the value must fall (inclusive)
+   * @throws IllegalArgumentException If the value is not in the given range
+   * @return the long value
+   */
+  def getLongInRange(props: Properties, name: String, default: Long, range: (Long, Long)): Long = {
+    val v = 
+      if(props.containsKey(name))
+        props.getProperty(name).toLong
+      else
+        default
+    if(v < range._1 || v > range._2)
+      throw new IllegalArgumentException(name + " has value " + v + " which is not in the range " + range + ".")
+    else
+      v
+  }
+
   /**
    * Read a boolean value from the properties instance
    * @param props The properties to read from
@@ -362,17 +403,29 @@ object Utils {
   
   /**
    * Register the given mbean with the platform mbean server,
-   * unregistering any mbean that was there before
+   * unregistering any mbean that was there before. Note,
+   * this method will not throw an exception if the registration
+   * fails (since there is nothing you can do and it isn't fatal),
+   * instead it just returns false indicating the registration failed.
    * @param mbean The object to register as an mbean
    * @param name The name to register this mbean with
+   * @return true if the registration succeeded
    */
-  def registerMBean(mbean: Object, name: String) {
-    val mbs = ManagementFactory.getPlatformMBeanServer()
-    mbs synchronized {
-      val objName = new ObjectName(name)
-      if(mbs.isRegistered(objName))
-        mbs.unregisterMBean(objName)
-      mbs.registerMBean(mbean, objName)
+  def registerMBean(mbean: Object, name: String): Boolean = {
+    try {
+      val mbs = ManagementFactory.getPlatformMBeanServer()
+      mbs synchronized {
+        val objName = new ObjectName(name)
+        if(mbs.isRegistered(objName))
+          mbs.unregisterMBean(objName)
+        mbs.registerMBean(mbean, objName)
+        true
+      }
+    } catch {
+      case e: Exception => {
+        error("Failed to register Mbean " + name, e)
+        false
+      }
     }
   }
   
@@ -392,7 +445,7 @@ object Utils {
   /**
    * Read an unsigned integer from the current position in the buffer, 
    * incrementing the position by 4 bytes
-   * @param The buffer to read from
+   * @param buffer The buffer to read from
    * @return The integer read, as a long to avoid signedness
    */
   def getUnsignedInt(buffer: ByteBuffer): Long = 
@@ -513,7 +566,7 @@ object Utils {
   }
 
   /**
-   * This method gets comma seperated values which contains key,value pairs and returns a map of
+   * This method gets comma separated values which contains key,value pairs and returns a map of
    * key value pairs. the format of allCSVal is key1:val1, key2:val2 ....
    */
   private def getCSVMap[K, V](allCSVals: String, exceptionMsg:String, successMsg:String) :Map[K, V] = {
@@ -525,10 +578,10 @@ object Utils {
     {
      try{
       val tempSplit = csVals(i).split(":")
-      logger.info(successMsg + tempSplit(0) + " : " + Integer.parseInt(tempSplit(1).trim))
+      info(successMsg + tempSplit(0) + " : " + Integer.parseInt(tempSplit(1).trim))
       map += tempSplit(0).asInstanceOf[K] -> Integer.parseInt(tempSplit(1).trim).asInstanceOf[V]
       } catch {
-          case _ =>  logger.error(exceptionMsg + ": " + csVals(i))
+          case _ =>  error(exceptionMsg + ": " + csVals(i))
         }
     }
     map
@@ -542,28 +595,74 @@ object Utils {
     }
   }
 
-  def getTopicRentionHours(retentionHours: String) : Map[String, Int] = {
+  def getTopicRetentionHours(retentionHours: String) : Map[String, Int] = {
     val exceptionMsg = "Malformed token for topic.log.retention.hours in server.properties: "
-    val successMsg =  "The retention hour for "
-    getCSVMap(retentionHours, exceptionMsg, successMsg)
+    val successMsg =  "The retention hours for "
+    val map: Map[String, Int] = getCSVMap(retentionHours, exceptionMsg, successMsg)
+    map.foreach{case(topic, hrs) =>
+                  require(hrs > 0, "Log retention hours value for topic " + topic + " is " + hrs +
+                                   " which is not greater than 0.")}
+    map
+  }
+
+  def getTopicRollHours(rollHours: String) : Map[String, Int] = {
+    val exceptionMsg = "Malformed token for topic.log.roll.hours in server.properties: "
+    val successMsg =  "The roll hours for "
+    val map: Map[String, Int] = getCSVMap(rollHours, exceptionMsg, successMsg)
+    map.foreach{case(topic, hrs) =>
+                  require(hrs > 0, "Log roll hours value for topic " + topic + " is " + hrs +
+                                   " which is not greater than 0.")}
+    map
+  }
+
+  def getTopicFileSize(fileSizes: String): Map[String, Int] = {
+    val exceptionMsg = "Malformed token for topic.log.file.size in server.properties: "
+    val successMsg =  "The log file size for "
+    val map: Map[String, Int] = getCSVMap(fileSizes, exceptionMsg, successMsg)
+    map.foreach{case(topic, size) =>
+                  require(size > 0, "Log file size value for topic " + topic + " is " + size +
+                                   " which is not greater than 0.")}
+    map
+  }
+
+  def getTopicRetentionSize(retentionSizes: String): Map[String, Long] = {
+    val exceptionMsg = "Malformed token for topic.log.retention.size in server.properties: "
+    val successMsg =  "The log retention size for "
+    val map: Map[String, Long] = getCSVMap(retentionSizes, exceptionMsg, successMsg)
+    map.foreach{case(topic, size) =>
+                 require(size > 0, "Log retention size value for topic " + topic + " is " + size +
+                                   " which is not greater than 0.")}
+    map
   }
 
   def getTopicFlushIntervals(allIntervals: String) : Map[String, Int] = {
     val exceptionMsg = "Malformed token for topic.flush.Intervals.ms in server.properties: "
     val successMsg =  "The flush interval for "
-    getCSVMap(allIntervals, exceptionMsg, successMsg)
+    val map: Map[String, Int] = getCSVMap(allIntervals, exceptionMsg, successMsg)
+    map.foreach{case(topic, interval) =>
+                  require(interval > 0, "Flush interval value for topic " + topic + " is " + interval +
+                                        " ms which is not greater than 0.")}
+    map
   }
 
   def getTopicPartitions(allPartitions: String) : Map[String, Int] = {
     val exceptionMsg = "Malformed token for topic.partition.counts in server.properties: "
     val successMsg =  "The number of partitions for topic  "
-    getCSVMap(allPartitions, exceptionMsg, successMsg)
+    val map: Map[String, Int] = getCSVMap(allPartitions, exceptionMsg, successMsg)
+    map.foreach{case(topic, count) =>
+                  require(count > 0, "The number of partitions for topic " + topic + " is " + count +
+                                     " which is not greater than 0.")}
+    map
   }
 
   def getConsumerTopicMap(consumerTopicString: String) : Map[String, Int] = {
     val exceptionMsg = "Malformed token for embeddedconsumer.topics in consumer.properties: "
-    val successMsg =  "The number of consumer thread for topic  "
-    getCSVMap(consumerTopicString, exceptionMsg, successMsg)
+    val successMsg =  "The number of consumer threads for topic  "
+    val map: Map[String, Int] = getCSVMap(consumerTopicString, exceptionMsg, successMsg)
+    map.foreach{case(topic, count) =>
+                  require(count > 0, "The number of consumer threads for topic " + topic + " is " + count +
+                                     " which is not greater than 0.")}
+    map
   }
 
   def getObject[T<:AnyRef](className: String): T = {
@@ -592,6 +691,39 @@ object Utils {
       NoCompressionCodec
     else
       CompressionCodec.getCompressionCodec(codecValueString.toInt)
+  }
+
+  def tryCleanupZookeeper(zkUrl: String, groupId: String) {
+    try {
+      val dir = "/consumers/" + groupId
+      logger.info("Cleaning up temporary zookeeper data under " + dir + ".")
+      val zk = new ZkClient(zkUrl, 30*1000, 30*1000, ZKStringSerializer)
+      zk.deleteRecursive(dir)
+      zk.close()
+    } catch {
+      case _ => // swallow
+    }
+  }
+
+  def checkRequiredArgs(parser: OptionParser, options: OptionSet, required: OptionSpec[_]*) {
+    for(arg <- required) {
+      if(!options.has(arg)) {
+        error("Missing required argument \"" + arg + "\"")
+        parser.printHelpOn(System.err)
+        System.exit(1)
+      }
+    }
+  }
+
+  /**
+   * Create a circular (looping) iterator over a collection.
+   * @param coll An iterable over the underlying collection.
+   * @return A circular iterator over the collection.
+   */
+  def circularIterator[T](coll: Iterable[T]) = {
+    val stream: Stream[T] =
+      for (forever <- Stream.continually(1); t <- coll) yield t
+    stream.iterator
   }
 }
 
@@ -685,5 +817,25 @@ class SnapshotStats(private val monitorDurationNs: Long = 600L * 1000L * 1000L *
     def durationSeconds: Double = (end.get - start) / (1000.0 * 1000.0 * 1000.0)
 
     def durationMs: Double = (end.get - start) / (1000.0 * 1000.0)
+  }
+}
+
+/**
+ *  A wrapper that synchronizes JSON in scala, which is not threadsafe.
+ */
+object SyncJSON extends Logging {
+  val myConversionFunc = {input : String => input.toInt}
+  JSON.globalNumberParser = myConversionFunc
+  val lock = new Object
+
+  def parseFull(input: String): Option[Any] = {
+    lock synchronized {
+      try {
+        JSON.parseFull(input)
+      } catch {
+        case t =>
+          throw new RuntimeException("Can't parse json string: %s".format(input), t)
+      }
+    }
   }
 }

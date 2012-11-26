@@ -17,22 +17,16 @@
 
 package kafka
 
-import consumer.ConsumerConfig
-import org.apache.log4j.Logger
-import producer.ProducerConfig
 import server.{KafkaConfig, KafkaServerStartable, KafkaServer}
-import utils.Utils
-import org.apache.log4j.jmx.LoggerDynamicMBean
+import utils.{Utils, Logging}
 
-object Kafka {
-  private val logger = Logger.getLogger(Kafka.getClass)
+
+object Kafka extends Logging {
 
   def main(args: Array[String]): Unit = {
-    val kafkaLog4jMBeanName = "kafka:type=kafka.KafkaLog4j"
-    Utils.swallow(logger.warn, Utils.registerMBean(new LoggerDynamicMBean(Logger.getRootLogger()), kafkaLog4jMBeanName))
 
-    if (!List(1, 3).contains(args.length)) {
-      println("USAGE: java [options] %s server.properties [consumer.properties producer.properties]".format(classOf[KafkaServer].getSimpleName()))
+    if (args.length != 1) {
+      println("USAGE: java [options] %s server.properties".format(classOf[KafkaServer].getSimpleName()))
       System.exit(1)
     }
   
@@ -40,14 +34,7 @@ object Kafka {
       val props = Utils.loadProps(args(0))
       val serverConfig = new KafkaConfig(props)
 
-      val kafkaServerStartble = args.length match {
-        case 3 =>
-          val consumerConfig = new ConsumerConfig(Utils.loadProps(args(1)))
-          val producerConfig = new ProducerConfig(Utils.loadProps(args(2)))
-          new KafkaServerStartable(serverConfig, consumerConfig, producerConfig)
-        case 1 =>
-          new KafkaServerStartable(serverConfig)
-      }
+      val kafkaServerStartble = new KafkaServerStartable(serverConfig)
 
       // attach shutdown handler to catch control-c
       Runtime.getRuntime().addShutdownHook(new Thread() {
@@ -61,7 +48,7 @@ object Kafka {
       kafkaServerStartble.awaitShutdown
     }
     catch {
-      case e => logger.fatal(e)
+      case e => fatal(e)
     }
     System.exit(0)
   }

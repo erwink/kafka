@@ -17,7 +17,6 @@
 
 package kafka.common
 
-import kafka.consumer._
 import kafka.message.InvalidMessageException
 import java.nio.ByteBuffer
 import java.lang.Throwable
@@ -59,5 +58,4 @@ class InvalidTopicException(message: String) extends RuntimeException(message) {
 }
 
 class MessageSizeTooLargeException(message: String) extends RuntimeException(message) {
-  def this() = this(null)
 }

@@ -21,31 +21,34 @@ import scala.collection.mutable._
 import scala.collection.JavaConversions._
 import org.I0Itec.zkclient._
 import joptsimple._
-import org.apache.log4j.Logger
-import java.util.Arrays.asList
 import java.util.Properties
 import java.util.Random
 import java.io.PrintStream
 import kafka.message._
-import kafka.utils.Utils
-import kafka.utils.ZkUtils
+import kafka.utils.{Utils, Logging}
 import kafka.utils.ZKStringSerializer
 
 /**
  * Consumer that dumps messages out to standard out.
  *
  */
-object ConsoleConsumer {
-  
-  private val logger = Logger.getLogger(getClass())
+object ConsoleConsumer extends Logging {
 
   def main(args: Array[String]) {
     val parser = new OptionParser
-    val topicIdOpt = parser.accepts("topic", "REQUIRED: The topic id to consume on.")
+    val topicIdOpt = parser.accepts("topic", "The topic id to consume on.")
                            .withRequiredArg
                            .describedAs("topic")
                            .ofType(classOf[String])
-    val zkConnectOpt = parser.accepts("zookeeper", "REQUIRED: The connection string for the zookeeper connection in the form host:port. " + 
+    val whitelistOpt = parser.accepts("whitelist", "Whitelist of topics to include for consumption.")
+                             .withRequiredArg
+                             .describedAs("whitelist")
+                             .ofType(classOf[String])
+    val blacklistOpt = parser.accepts("blacklist", "Blacklist of topics to exclude from consumption.")
+                             .withRequiredArg
+                             .describedAs("blacklist")
+                             .ofType(classOf[String])
+    val zkConnectOpt = parser.accepts("zookeeper", "REQUIRED: The connection string for the zookeeper connection in the form host:port. " +
                                       "Multiple URLS can be given to allow fail-over.")
                            .withRequiredArg
                            .describedAs("urls")
@@ -65,6 +68,12 @@ object ConsoleConsumer {
                            .describedAs("size")
                            .ofType(classOf[java.lang.Integer])
                            .defaultsTo(2 * 1024 * 1024)
+    val consumerTimeoutMsOpt = parser.accepts("consumer-timeout-ms", "consumer throws timeout exception after waiting this much " +
+                                              "of time without incoming messages")
+                           .withRequiredArg
+                           .describedAs("prop")
+                           .ofType(classOf[java.lang.Integer])
+                           .defaultsTo(-1)
     val messageFormatterOpt = parser.accepts("formatter", "The name of a class to use for formatting kafka messages for display.")
                            .withRequiredArg
                            .describedAs("class")
@@ -89,27 +98,42 @@ object ConsoleConsumer {
         "skip it instead of halt.")
 
     val options: OptionSet = tryParse(parser, args)
-    checkRequiredArgs(parser, options, topicIdOpt, zkConnectOpt)
+    Utils.checkRequiredArgs(parser, options, zkConnectOpt)
     
+    val topicOrFilterOpt = List(topicIdOpt, whitelistOpt, blacklistOpt).filter(options.has)
+    if (topicOrFilterOpt.size != 1) {
+      error("Exactly one of whitelist/blacklist/topic is required.")
+      parser.printHelpOn(System.err)
+      System.exit(1)
+    }
+    val topicArg = options.valueOf(topicOrFilterOpt.head)
+    val filterSpec = if (options.has(blacklistOpt))
+      new Blacklist(topicArg)
+    else
+      new Whitelist(topicArg)
+
     val props = new Properties()
     props.put("groupid", options.valueOf(groupIdOpt))
-    props.put("socket.buffer.size", options.valueOf(socketBufferSizeOpt).toString)
+    props.put("socket.buffersize", options.valueOf(socketBufferSizeOpt).toString)
     props.put("fetch.size", options.valueOf(fetchSizeOpt).toString)
     props.put("auto.commit", "true")
     props.put("autocommit.interval.ms", options.valueOf(autoCommitIntervalOpt).toString)
     props.put("autooffset.reset", if(options.has(resetBeginningOpt)) "smallest" else "largest")
     props.put("zk.connect", options.valueOf(zkConnectOpt))
+    props.put("consumer.timeout.ms", options.valueOf(consumerTimeoutMsOpt).toString)
     val config = new ConsumerConfig(props)
     val skipMessageOnError = if (options.has(skipMessageOnErrorOpt)) true else false
     
-    val topic = options.valueOf(topicIdOpt)
     val messageFormatterClass = Class.forName(options.valueOf(messageFormatterOpt))
     val formatterArgs = tryParseFormatterArgs(options.valuesOf(messageFormatterArgOpt))
     
     val maxMessages = if(options.has(maxMessagesOpt)) options.valueOf(maxMessagesOpt).intValue else -1
 
     val connector = Consumer.create(config)
-    
+
+    if(options.has(resetBeginningOpt))
+      tryCleanupZookeeper(options.valueOf(zkConnectOpt), options.valueOf(groupIdOpt))
+
     Runtime.getRuntime.addShutdownHook(new Thread() {
       override def run() {
         connector.shutdown()
@@ -118,25 +142,24 @@ object ConsoleConsumer {
           tryCleanupZookeeper(options.valueOf(zkConnectOpt), options.valueOf(groupIdOpt))
       }
     })
-    
-    var stream = connector.createMessageStreams(Map(topic -> 1)).get(topic).get.get(0)
-    val iter =
-      if(maxMessages >= 0)
-        stream.slice(0, maxMessages)
-      else
-        stream
+
+    val stream = connector.createMessageStreamsByFilter(filterSpec).get(0)
+    val iter = if(maxMessages >= 0)
+      stream.slice(0, maxMessages)
+    else
+      stream
 
     val formatter: MessageFormatter = messageFormatterClass.newInstance().asInstanceOf[MessageFormatter]
     formatter.init(formatterArgs)
 
     try {
-      for(message <- iter) {
+      for(messageAndTopic <- iter) {
         try {
-          formatter.writeTo(message, System.out)
+          formatter.writeTo(messageAndTopic.message, System.out)
         } catch {
           case e =>
             if (skipMessageOnError)
-              logger.error("Error processing message, skipping this message: ", e)
+              error("Error processing message, skipping this message: ", e)
             else
               throw e
         }
@@ -149,7 +172,7 @@ object ConsoleConsumer {
         }
       }
     } catch {
-      case e => logger.error("Error processing message, stopping consumer: ", e)
+      case e => error("Error processing message, stopping consumer: ", e)
     }
       
     System.out.flush()
@@ -164,16 +187,6 @@ object ConsoleConsumer {
       case e: OptionException => {
         Utils.croak(e.getMessage)
         null
-      }
-    }
-  }
-  
-  def checkRequiredArgs(parser: OptionParser, options: OptionSet, required: OptionSpec[_]*) {
-    for(arg <- required) {
-      if(!options.has(arg)) {
-        logger.error("Missing required argument \"" + arg + "\"")
-        parser.printHelpOn(System.err)
-        System.exit(1)
       }
     }
   }
@@ -203,11 +216,28 @@ object ConsoleConsumer {
       output.write('\n')
     }
   }
+
+  class ChecksumMessageFormatter extends MessageFormatter {
+    private var topicStr: String = _
+    
+    override def init(props: Properties) {
+      topicStr = props.getProperty("topic")
+      if (topicStr != null) 
+        topicStr = topicStr + "-"
+      else
+        topicStr = ""
+    }
+    
+    def writeTo(message: Message, output: PrintStream) {
+      val chksum = message.checksum
+      output.println(topicStr + "checksum:" + chksum)
+    }
+  }
   
   def tryCleanupZookeeper(zkUrl: String, groupId: String) {
     try {
       val dir = "/consumers/" + groupId
-      logger.info("Cleaning up temporary zookeeper data under " + dir + ".")
+      info("Cleaning up temporary zookeeper data under " + dir + ".")
       val zk = new ZkClient(zkUrl, 30*1000, 30*1000, ZKStringSerializer)
       zk.deleteRecursive(dir)
       zk.close()
